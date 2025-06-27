@@ -2,9 +2,9 @@
 #include <string.h>
 #include <winsock2.h>
 #include <stdint.h>
-#include <stdio.h>
 #include "../include/structures.h"
 #include "../libs/sha256.h"
+#include "../include/tcp_manager.h"
 
 #define CLIENT_LONG_PASSWORD     0x00000001
 #define CLIENT_FOUND_ROWS        0x00000002
@@ -14,68 +14,18 @@
 #define CLIENT_SECURE_CONNECTION 0x00008000
 #define CLIENT_PLUGIN_AUTH       0x00080000
 
-int net_tcp_open(char* host, int port, SOCKET* sock) {
-    WSADATA wsadata;
-
-    if (WSAStartup(MAKEWORD(2, 2), &wsadata) != 0) {
-        return 1; // WSAStartup failed
-    }
-
-    *sock = socket(PF_INET, SOCK_STREAM, 0);
-    if (*sock == INVALID_SOCKET) {
-        WSACleanup();
-        return 2; // Invalid socket
-    }
-
-    SOCKADDR_IN sock_address;
-    memset(&sock_address, 0, sizeof(sock_address));
-
-    sock_address.sin_family = AF_INET;
-    sock_address.sin_port = htons(port);
-
-    unsigned long addr = inet_addr(host);
-    if (addr == INADDR_NONE) {
-        closesocket(*sock);
-        WSACleanup();
-        return 4; // Inaddr none
-    }
-
-    sock_address.sin_addr.s_addr = addr;
-
-    int result = connect(*sock, (SOCKADDR*) &sock_address, sizeof(sock_address));
-
-    if (result == SOCKET_ERROR) {
-        closesocket(*sock);
-        WSACleanup();
-        return 3; // Socket error
-    }
-
-    return 0;
-}
-
 int mysql_driver_read_handshake(SOCKET sock, mysql_server_handshake_data* data) {
-    char header[4];
-    int rec = recv(sock, (char*) header, 4, 0);
-    if (rec != 4) {
+    mysql_packet_t packet = tcp_read_socket_response(sock);
+    if (packet.error) {
         return 1;
     }
 
-    unsigned int payload_len = header[0] + header[1] * 256 + header[2] * 65536;
-    unsigned char seq_id = header[3];
+    unsigned int payload_len = packet.payload_len;
+    unsigned char seq_id = packet.seq_id;
 
     unsigned char* payload = malloc(payload_len);
     if (payload == NULL) {
         return 2;
-    }
-
-    int total_recv = 0;
-    while (total_recv < payload_len) {
-        int rec = recv(sock, (char*)payload + total_recv, payload_len - total_recv, 0);
-        if (rec <= 0) {
-            free(payload);
-            return 3;
-        }
-        total_recv += rec;
     }
 
     int offset = 0;
@@ -194,7 +144,9 @@ int mysql_driver_reply_client_handshake_response_packet(
             CLIENT_CONNECT_WITH_DB |
             CLIENT_PROTOCOL_41 |
             CLIENT_SECURE_CONNECTION |
-            CLIENT_PLUGIN_AUTH;
+            CLIENT_PLUGIN_AUTH |
+            CLIENT_FOUND_ROWS |
+            CLIENT_LONG_FLAG;
 
     unsigned char payload[1024];
     int offset = 0;
@@ -241,15 +193,9 @@ int mysql_driver_reply_client_handshake_response_packet(
 
     memcpy(packet + 4, payload, payload_len);
 
-    int total_len = payload_len + 4;
-    int total_sent = 0;
-    while (total_sent < total_len) {
-        int sent = send(socket, (char*)packet + total_sent, total_len - total_sent, 0);
-        if (sent == SOCKET_ERROR || sent == 0) {
-            WSACleanup();
-            return 200;
-        }
-        total_sent += sent;
+    int res = tcp_send_packet(socket, 1, payload, payload_len);
+    if (res != 0) {
+        return 200 + res;
     }
 
     unsigned char ok_header[4];
@@ -296,7 +242,7 @@ void mysql_driver_free_handshake(mysql_server_handshake_data* data) {
 
 int mysql_driver_net_handshake(mysql_connection_data connection_data, SOCKET* out_socket) {
     SOCKET sock;
-    int res = net_tcp_open(connection_data.host, connection_data.port, &sock);
+    int res = tcp_connect(connection_data.host, connection_data.port, &sock);
 
     if (res != 0) return res;
 
